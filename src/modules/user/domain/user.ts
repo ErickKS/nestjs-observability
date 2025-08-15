@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { Span } from '@/infra/observability/decorators/span.decorator'
 
 interface CreateUserProps {
   name: string
@@ -18,6 +19,12 @@ export class User {
     return this._name
   }
 
+  // Use @Span only on methods with relevant business rules, not on simple operations like this one (demonstration purposes only)
+  @Span({
+    name: 'User.create',
+    captureArgs: true,
+    captureResult: true,
+  })
   static create({ name }: CreateUserProps): User {
     const id = randomUUID()
     return new User(id, name)
