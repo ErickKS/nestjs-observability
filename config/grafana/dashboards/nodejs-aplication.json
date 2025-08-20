@@ -57,7 +57,7 @@
               },
               {
                 "color": "red",
-                "value": 80
+                "value": 1
               }
             ]
           }
@@ -85,7 +85,7 @@
         "sortBy": [
           {
             "desc": true,
-            "displayName": "Trace ID"
+            "displayName": "Start time"
           }
         ]
       },
