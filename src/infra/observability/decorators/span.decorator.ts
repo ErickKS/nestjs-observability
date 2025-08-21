@@ -10,75 +10,166 @@ interface TraceOptions {
   events?: string[]
 }
 
+function isAsyncFunction(fn: (...args: unknown[]) => unknown): boolean {
+  // Check constructor name first (most reliable)
+  if (fn.constructor.name === 'AsyncFunction') return true
+
+  // Check function string representation
+  const fnString = fn.toString().replace(/\s+/g, ' ').trim()
+
+  // Look for async keyword at the beginning (after possible whitespace)
+  if (/^async\s/.test(fnString)) return true
+
+  // Look for async in method definitions: async methodName() or async *methodName()
+  if (/:\s*async\s+/.test(fnString) || /async\s+\*/.test(fnString)) return true
+
+  return false
+}
+
+function executeWithSpan<T>(
+  originalMethod: (...args: unknown[]) => T | Promise<T>,
+  context: unknown,
+  args: unknown[],
+  spanName: string,
+  options: TraceOptions,
+  isAsync: boolean
+): T | Promise<T> {
+  const tracer = trace.getTracer('custom-tracer')
+
+  if (isAsync) {
+    return tracer.startActiveSpan(spanName, { kind: options.kind || SpanKind.INTERNAL }, async span => {
+      try {
+        span.addEvent('operation.started')
+
+        if (options.captureArgs && args.length > 0) {
+          const sanitizedArgs = args.map(arg => sanitizeObject(arg))
+          span.setAttribute('input.args', JSON.stringify(sanitizedArgs))
+        }
+
+        const result = await originalMethod.apply(context, args)
+
+        span.setAttributes({ 'operation.success': true })
+
+        if (options.captureResult && result !== undefined && result !== null) {
+          const sanitizedResult = sanitizeObject(result)
+          span.setAttribute('output.result', JSON.stringify(sanitizedResult))
+        }
+
+        if (options.events) {
+          options.events.forEach(event => span.addEvent(event))
+        }
+
+        span.addEvent('operation.completed')
+        span.setStatus({ code: SpanStatusCode.OK })
+
+        return result
+      } catch (error) {
+        const err = error as Error
+
+        if (options.captureExceptions !== false) {
+          span.recordException(err)
+          span.setAttributes({
+            'error.name': err.name,
+            'error.message': err.message,
+            'operation.success': false,
+          })
+        }
+
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: err.message,
+        })
+
+        span.addEvent('operation.failed', {
+          'error.type': err.constructor.name,
+        })
+
+        throw error
+      } finally {
+        span.end()
+      }
+    }) as Promise<T>
+  }
+
+  // Synchronous execution
+  return tracer.startActiveSpan(spanName, { kind: options.kind || SpanKind.INTERNAL }, span => {
+    try {
+      span.addEvent('operation.started')
+
+      if (options.captureArgs && args.length > 0) {
+        const sanitizedArgs = args.map(arg => sanitizeObject(arg))
+        span.setAttribute('input.args', JSON.stringify(sanitizedArgs))
+      }
+
+      const result = originalMethod.apply(context, args)
+
+      // Handle case where sync method returns a Promise
+      if (result && typeof result.then === 'function') {
+        console.warn(`Method ${spanName} appears to return a Promise but was not detected as async. Consider using async/await.`)
+      }
+
+      span.setAttributes({ 'operation.success': true })
+
+      if (options.captureResult && result !== undefined && result !== null) {
+        const sanitizedResult = sanitizeObject(result)
+        span.setAttribute('output.result', JSON.stringify(sanitizedResult))
+      }
+
+      if (options.events) {
+        options.events.forEach(event => span.addEvent(event))
+      }
+
+      span.addEvent('operation.completed')
+      span.setStatus({ code: SpanStatusCode.OK })
+
+      return result
+    } catch (error) {
+      const err = error as Error
+
+      if (options.captureExceptions !== false) {
+        span.recordException(err)
+        span.setAttributes({
+          'error.name': err.name,
+          'error.message': err.message,
+          'operation.success': false,
+        })
+      }
+
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: err.message,
+      })
+
+      span.addEvent('operation.failed', {
+        'error.type': err.constructor.name,
+      })
+
+      throw error
+    } finally {
+      span.end()
+    }
+  }) as T
+}
+
 export function Span(options: TraceOptions = {}) {
   return (target: unknown, propertyName: string, descriptor: PropertyDescriptor) => {
     const originalMethod = descriptor.value
     const spanName = options.name || `${(target as object).constructor.name}.${propertyName}`
 
-    descriptor.value = async function (...args: unknown[]) {
-      const tracer = trace.getTracer('custom-tracer')
+    if (typeof originalMethod !== 'function') {
+      throw new Error(`@Span can only be applied to methods. ${propertyName} is not a function.`)
+    }
 
-      return await tracer.startActiveSpan(
-        spanName,
-        {
-          kind: options.kind || SpanKind.INTERNAL,
-        },
-        async span => {
-          try {
-            span.addEvent('operation.started')
+    const isAsync = isAsyncFunction(originalMethod)
 
-            if (options.captureArgs && args.length > 0) {
-              const sanitizedArgs = args.map(arg => sanitizeObject(arg))
-              span.setAttribute('input.args', JSON.stringify(sanitizedArgs))
-            }
-
-            const result = await originalMethod.apply(this, args)
-
-            span.setAttributes({
-              'operation.success': true,
-            })
-
-            if (options.captureResult && result) {
-              const sanitizedResult = sanitizeObject(result)
-              span.setAttribute('output.result', JSON.stringify(sanitizedResult))
-            }
-            if (options.events) {
-              for (const event of options.events) {
-                span.addEvent(event)
-              }
-            }
-
-            span.addEvent('operation.completed')
-            span.setStatus({ code: SpanStatusCode.OK })
-
-            return result
-          } catch (error) {
-            const err = error as Error
-
-            if (options.captureExceptions !== false) {
-              span.recordException(err)
-              span.setAttributes({
-                'error.name': err.name,
-                'error.message': err.message,
-                'operation.success': false,
-              })
-            }
-
-            span.setStatus({
-              code: SpanStatusCode.ERROR,
-              message: err.message,
-            })
-
-            span.addEvent('operation.failed', {
-              'error.type': err.constructor.name,
-            })
-
-            throw error
-          } finally {
-            span.end()
-          }
-        }
-      )
+    if (isAsync) {
+      descriptor.value = async function (...args: unknown[]) {
+        return await executeWithSpan(originalMethod, this, args, spanName, options, true)
+      }
+    } else {
+      descriptor.value = function (...args: unknown[]) {
+        return executeWithSpan(originalMethod, this, args, spanName, options, false)
+      }
     }
 
     return descriptor
@@ -90,12 +181,14 @@ function isSensitiveField(fieldName: string): boolean {
   return sensitiveFields.some(sensitive => fieldName.toLowerCase().includes(sensitive))
 }
 
-function sanitizeObject(obj: unknown, maxDepth: number = 3, currentDepth: number = 0) {
+function sanitizeObject(obj: unknown, maxDepth: number = 3, currentDepth: number = 0): unknown {
   if (currentDepth >= maxDepth) return '[Object: max depth reached]'
   if (obj === null || obj === undefined) return obj
   if (typeof obj !== 'object') return obj
   if (obj instanceof Date) return obj.toISOString()
-  if (Array.isArray(obj)) return obj.map(item => sanitizeObject(item, maxDepth, currentDepth + 1))
+  if (Array.isArray(obj)) {
+    return obj.map(item => sanitizeObject(item, maxDepth, currentDepth + 1))
+  }
 
   const sanitized: Record<string, unknown> = {}
 
