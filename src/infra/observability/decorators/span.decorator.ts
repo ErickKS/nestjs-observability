@@ -1,4 +1,4 @@
-import { Attributes, Span as OTelSpan, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api'
+import { SpanKind, SpanStatusCode, trace } from '@opentelemetry/api'
 
 interface TraceOptions {
   name?: string
@@ -6,140 +6,79 @@ interface TraceOptions {
   captureArgs?: boolean
   captureResult?: boolean
   captureExceptions?: boolean
-  attributes?: Attributes
+  attributes?: Record<string, unknown>
   events?: string[]
 }
 
-type SpanOptionsFunction = (...args: unknown[]) => TraceOptions
-type SpanConfig = TraceOptions | SpanOptionsFunction
-
-export function Span(config: SpanConfig = {}) {
+export function Span(options: TraceOptions = {}) {
   return (target: unknown, propertyName: string, descriptor: PropertyDescriptor) => {
     const originalMethod = descriptor.value
+    const spanName = options.name || `${(target as object).constructor.name}.${propertyName}`
 
-    const isAsync = originalMethod.constructor.name === 'AsyncFunction'
+    descriptor.value = async function (...args: unknown[]) {
+      const tracer = trace.getTracer('custom-tracer')
 
-    const createSpanLogic = (args: unknown[], span: OTelSpan, options: TraceOptions) => {
-      const spanName = options.name || `${(target as object).constructor.name}.${propertyName}`
+      return await tracer.startActiveSpan(
+        spanName,
+        {
+          kind: options.kind || SpanKind.INTERNAL,
+        },
+        async span => {
+          try {
+            span.addEvent('operation.started')
 
-      span.addEvent('operation.started')
-
-      if (options.captureArgs && args.length > 0) {
-        const sanitizedArgs = args.map(arg => sanitizeObject(arg))
-        span.setAttribute('input.args', JSON.stringify(sanitizedArgs))
-      }
-
-      if (options.attributes) span.setAttributes(options.attributes)
-
-      return spanName
-    }
-
-    if (isAsync) {
-      descriptor.value = async function (...args: unknown[]) {
-        const options = typeof config === 'function' ? config(...args) : config
-        const spanName = options.name || `${(target as object).constructor.name}.${propertyName}`
-
-        const tracer = trace.getTracer('custom-tracer')
-        return await tracer.startActiveSpan(
-          spanName,
-          {
-            kind: options.kind || SpanKind.INTERNAL,
-          },
-          async span => {
-            try {
-              createSpanLogic(args, span, options)
-
-              const result = await originalMethod.apply(this, args)
-
-              span.setAttributes({
-                'operation.success': true,
-              })
-              if (options.captureResult && result) {
-                const sanitizedResult = sanitizeObject(result)
-                span.setAttribute('output.result', JSON.stringify(sanitizedResult))
-              }
-              options.events?.forEach(event => span.addEvent(event))
-              span.addEvent('operation.completed')
-              span.setStatus({ code: SpanStatusCode.OK })
-              return result
-            } catch (error) {
-              const err = error as Error
-              if (options.captureExceptions !== false) {
-                span.recordException(err)
-                span.setAttributes({
-                  'error.name': err.name,
-                  'error.message': err.message,
-                  'operation.success': false,
-                })
-              }
-              span.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: err.message,
-              })
-              span.addEvent('operation.failed', {
-                'error.type': err.constructor.name,
-              })
-              throw error
-            } finally {
-              span.end()
+            if (options.captureArgs && args.length > 0) {
+              const sanitizedArgs = args.map(arg => sanitizeObject(arg))
+              span.setAttribute('input.args', JSON.stringify(sanitizedArgs))
             }
-          }
-        )
-      }
-    } else {
-      descriptor.value = function (...args: unknown[]) {
-        const options = typeof config === 'function' ? config(...args) : config
-        const spanName = options.name || `${(target as object).constructor.name}.${propertyName}`
 
-        const tracer = trace.getTracer('custom-tracer')
-        return tracer.startActiveSpan(
-          spanName,
-          {
-            kind: options.kind || SpanKind.INTERNAL,
-          },
-          span => {
-            try {
-              createSpanLogic(args, span, options)
+            const result = await originalMethod.apply(this, args)
 
-              const result = originalMethod.apply(this, args)
+            span.setAttributes({
+              'operation.success': true,
+            })
 
-              span.setAttributes({
-                'operation.success': true,
-              })
-
-              if (options.captureResult && result) {
-                const sanitizedResult = sanitizeObject(result)
-                span.setAttribute('output.result', JSON.stringify(sanitizedResult))
-              }
-
-              options.events?.forEach(event => span.addEvent(event))
-              span.addEvent('operation.completed')
-              span.setStatus({ code: SpanStatusCode.OK })
-              return result
-            } catch (error) {
-              const err = error as Error
-              if (options.captureExceptions !== false) {
-                span.recordException(err)
-                span.setAttributes({
-                  'error.name': err.name,
-                  'error.message': err.message,
-                  'operation.success': false,
-                })
-              }
-              span.setStatus({
-                code: SpanStatusCode.ERROR,
-                message: err.message,
-              })
-              span.addEvent('operation.failed', {
-                'error.type': err.constructor.name,
-              })
-              throw error
-            } finally {
-              span.end()
+            if (options.captureResult && result) {
+              const sanitizedResult = sanitizeObject(result)
+              span.setAttribute('output.result', JSON.stringify(sanitizedResult))
             }
+            if (options.events) {
+              for (const event of options.events) {
+                span.addEvent(event)
+              }
+            }
+
+            span.addEvent('operation.completed')
+            span.setStatus({ code: SpanStatusCode.OK })
+
+            return result
+          } catch (error) {
+            const err = error as Error
+
+            if (options.captureExceptions !== false) {
+              span.recordException(err)
+              span.setAttributes({
+                'error.name': err.name,
+                'error.message': err.message,
+                'operation.success': false,
+              })
+            }
+
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: err.message,
+            })
+
+            span.addEvent('operation.failed', {
+              'error.type': err.constructor.name,
+            })
+
+            throw error
+          } finally {
+            span.end()
           }
-        )
-      }
+        }
+      )
     }
 
     return descriptor
@@ -159,6 +98,7 @@ function sanitizeObject(obj: unknown, maxDepth: number = 3, currentDepth: number
   if (Array.isArray(obj)) return obj.map(item => sanitizeObject(item, maxDepth, currentDepth + 1))
 
   const sanitized: Record<string, unknown> = {}
+
   for (const [key, value] of Object.entries(obj)) {
     if (isSensitiveField(key)) {
       sanitized[key] = '[REDACTED]'
@@ -168,5 +108,6 @@ function sanitizeObject(obj: unknown, maxDepth: number = 3, currentDepth: number
       sanitized[key] = value
     }
   }
+
   return sanitized
 }
